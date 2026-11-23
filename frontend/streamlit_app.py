@@ -134,7 +134,7 @@ if page == "Financial Reports":
         report_payload = json.loads(report_raw)
         report_data = pd.json_normalize([report_payload])
         st.success("Report generated and saved to app/storage/reports")
-        st.dataframe(report_data.T)
+        st.dataframe(report_data.T.astype(str))
 
     render_ai_page_insight(
         "financial_reports",
