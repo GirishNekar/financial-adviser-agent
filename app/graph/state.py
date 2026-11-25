@@ -13,3 +13,6 @@ class FinanceAgentState(TypedDict, total=False):
     analysis_results: dict[str, Any]
     reasoning: str
     final_answer: str
+    messages: list[Any]
+    tool_trace: list[str]
+    iterations: int

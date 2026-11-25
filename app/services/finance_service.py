@@ -100,6 +100,129 @@ class FinanceService:
             "can_afford": available >= amount,
         }
 
+    DISCRETIONARY_CATEGORIES = ("Entertainment", "Shopping", "Travel", "Food")
+    LIQUID_ASSETS = ("Fixed Deposit", "FD", "Mutual Fund", "Savings", "Liquid Fund", "Gold")
+
+    def _emergency_fund_balance(self, user_id: int) -> float:
+        ef = [g for g in self.goal_progress(user_id) if g["goal_name"] == "Emergency Fund"]
+        # Goals can repeat across periods; the largest balance is the fund actually built up.
+        return max((float(g["current_amount"]) for g in ef), default=0.0)
+
+    def what_if_scenario(
+        self,
+        user_id: int,
+        month: str,
+        income_change: float = 0.0,
+        expense_change: float = 0.0,
+        one_time_cost: float = 0.0,
+        months_until_cost: int = 0,
+    ) -> dict[str, Any]:
+        totals = self.repository.calculate_totals(user_id=user_id, month=month)
+        current_surplus = totals["total_income"] - totals["total_expense"]
+        new_income = totals["total_income"] + income_change
+        new_expense = totals["total_expense"] + expense_change
+        new_surplus = new_income - new_expense
+        emergency_fund = self._emergency_fund_balance(user_id)
+
+        # Cash available when the cost is due: surplus saved until then (incl. this month) + 20% of emergency fund.
+        saving_months = max(1, months_until_cost + 1) if months_until_cost >= 0 else 1
+        cash_from_surplus = max(0.0, new_surplus) * saving_months
+        available_without_ef = cash_from_surplus
+        available_with_ef_buffer = cash_from_surplus + emergency_fund * 0.2
+        shortfall = max(0.0, one_time_cost - available_with_ef_buffer)
+        months_to_save = (one_time_cost / new_surplus) if new_surplus > 0 and one_time_cost > 0 else None
+
+        return {
+            "month": month,
+            "current": {
+                "income": totals["total_income"],
+                "expense": totals["total_expense"],
+                "monthly_surplus": current_surplus,
+            },
+            "scenario": {
+                "income_change": income_change,
+                "expense_change": expense_change,
+                "income": new_income,
+                "expense": new_expense,
+                "monthly_surplus": new_surplus,
+                "surplus_increase": new_surplus - current_surplus,
+            },
+            "one_time_cost": one_time_cost,
+            "months_until_cost": months_until_cost,
+            "surplus_saved_by_then": cash_from_surplus,
+            "emergency_fund_balance": emergency_fund,
+            "available_without_emergency_fund": available_without_ef,
+            "available_with_20pct_emergency_fund": available_with_ef_buffer,
+            "can_afford_from_surplus_alone": available_without_ef >= one_time_cost if one_time_cost else None,
+            "can_afford_with_emergency_buffer": available_with_ef_buffer >= one_time_cost if one_time_cost else None,
+            "can_afford_using_full_emergency_fund": (cash_from_surplus + emergency_fund) >= one_time_cost if one_time_cost else None,
+            "shortfall": shortfall,
+            "months_of_new_surplus_to_cover_cost": months_to_save,
+        }
+
+    def funding_plan(self, user_id: int, month: str, cost: float, months_until_cost: int = 0) -> dict[str, Any]:
+        totals = self.repository.calculate_totals(user_id=user_id, month=month)
+        surplus = max(0.0, totals["total_income"] - totals["total_expense"])
+        spending = self.monthly_spending(user_id=user_id, month=month)["by_category"]
+        investments = self.investment_summary(user_id)["by_asset"]
+        emergency_fund = self._emergency_fund_balance(user_id)
+
+        saving_months = max(1, months_until_cost + 1)
+        discretionary = {c: float(v) for c, v in spending.items() if c in self.DISCRETIONARY_CATEGORIES}
+        # Assume half of discretionary spend can be cut temporarily.
+        cut_per_month = sum(discretionary.values()) * 0.5
+        liquid = {a: float(v) for a, v in investments.items() if any(k.lower() in a.lower() for k in self.LIQUID_ASSETS)}
+
+        remaining = cost
+        sources: list[dict[str, Any]] = []
+
+        def take(name: str, available: float, note: str) -> None:
+            nonlocal remaining
+            if remaining <= 0 or available <= 0:
+                return
+            used = min(available, remaining)
+            remaining -= used
+            sources.append({"source": name, "amount": round(used, 2), "available": round(available, 2), "note": note})
+
+        take("Monthly surplus saved until the cost is due", surplus * saving_months, f"{saving_months} month(s) x Rs {surplus:,.0f}")
+        take("Temporary cuts to discretionary spending", cut_per_month * saving_months, "50% cut on " + ", ".join(discretionary) if discretionary else "")
+        take("Emergency fund", emergency_fund, "this is what the emergency fund is for; rebuild it afterwards")
+        for asset, amount in sorted(liquid.items(), key=lambda x: -x[1]):
+            take(f"Redeem part of {asset}", amount, "check exit load / tax before redeeming")
+
+        def emi(principal: float, annual_rate: float, months: int) -> float:
+            if principal <= 0:
+                return 0.0
+            r = annual_rate / 12
+            if r == 0:
+                return principal / months
+            return principal * r * (1 + r) ** months / ((1 + r) ** months - 1)
+
+        emi_options = [
+            {"option": "0% hospital / card EMI", "months": m, "monthly_emi": round(emi(cost, 0.0, m), 2),
+             "fits_in_surplus": emi(cost, 0.0, m) <= surplus}
+            for m in (3, 6)
+        ] + [
+            {"option": "Medical / personal loan @12%", "months": m, "monthly_emi": round(emi(cost, 0.12, m), 2),
+             "fits_in_surplus": emi(cost, 0.12, m) <= surplus}
+            for m in (12, 24)
+        ]
+
+        return {
+            "cost": cost,
+            "monthly_surplus": surplus,
+            "discretionary_spend_by_category": discretionary,
+            "emergency_fund_balance": emergency_fund,
+            "liquid_investments": liquid,
+            "suggested_funding_mix": sources,
+            "uncovered_after_own_funds": round(max(0.0, remaining), 2),
+            "emi_options_for_full_cost": emi_options,
+            "notes": [
+                "Check health insurance / employer cover first; it may cover most of a medical cost.",
+                "Funding mix is applied in order: surplus, discretionary cuts, emergency fund, liquid investments.",
+            ],
+        }
+
     def spending_risks(self, user_id: int, month: str | None = None) -> list[str]:
         spending = self.monthly_spending(user_id=user_id, month=month)
         totals = self.repository.calculate_totals(user_id=user_id, month=month)

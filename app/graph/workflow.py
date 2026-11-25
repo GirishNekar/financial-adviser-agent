@@ -6,13 +6,14 @@ import re
 from datetime import datetime
 from typing import Any
 
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
 from app.config import config
 from app.graph.state import FinanceAgentState
 from app.middleware.error_handler import LLMTimeoutError
-from app.prompts.templates import FINAL_ANSWER_PROMPT, SYSTEM_PROMPT, TOOL_SELECTION_PROMPT
+from app.prompts.templates import AGENT_SYSTEM_PROMPT, FINAL_ANSWER_PROMPT, SYSTEM_PROMPT, TOOL_SELECTION_PROMPT
 from app.services.container import container
 from app.tools.finance_tools import build_finance_tools
 from app.utils.logger import logger
@@ -161,6 +162,8 @@ def _is_greeting_message(text: str) -> bool:
 class FinanceWorkflow:
     def __init__(self) -> None:
         self.tools = build_finance_tools()
+        # csv_loader returns every user's rows, so it is not exposed to the LLM.
+        self.agent_tools = {k: v for k, v in self.tools.items() if k != "csv_loader"}
         self.repository = container.repository
         self.llm_enabled = config.llm_enabled
         self.llm_strict_mode = config.llm_strict_mode
@@ -181,22 +184,120 @@ class FinanceWorkflow:
         )
 
     def _build_graph(self):
+        # Tool-calling agent loop: the LLM decides which tools to call (and with what
+        # arguments), sees the results, and repeats until it can answer.
         workflow = StateGraph(FinanceAgentState)
 
-        workflow.add_node("understand_request", self.understand_request)
-        workflow.add_node("select_tools", self.select_tools)
-        workflow.add_node("execute_analysis", self.execute_analysis)
-        workflow.add_node("reasoning", self.reasoning)
-        workflow.add_node("generate_advice", self.generate_advice)
+        workflow.add_node("agent", self.agent_step)
+        workflow.add_node("tools", self.tool_step)
 
-        workflow.add_edge(START, "understand_request")
-        workflow.add_edge("understand_request", "select_tools")
-        workflow.add_edge("select_tools", "execute_analysis")
-        workflow.add_edge("execute_analysis", "reasoning")
-        workflow.add_edge("reasoning", "generate_advice")
-        workflow.add_edge("generate_advice", END)
+        workflow.add_edge(START, "agent")
+        workflow.add_conditional_edges("agent", self._route_after_agent, {"tools": "tools", "end": END})
+        workflow.add_edge("tools", "agent")
 
         return workflow.compile()
+
+    def _route_after_agent(self, state: FinanceAgentState) -> str:
+        last = state["messages"][-1]
+        if isinstance(last, AIMessage) and last.tool_calls and state.get("iterations", 0) < config.agent_max_iterations:
+            return "tools"
+        return "end"
+
+    def agent_step(self, state: FinanceAgentState) -> FinanceAgentState:
+        # The Cortex endpoint rejects several tool results for one turn, so keep only the first
+        # tool call; the model requests the next one on its following turn.
+        llm = self.llm.bind_tools(list(self.agent_tools.values()))
+        messages = state["messages"]
+        if state.get("iterations", 0) >= config.agent_max_iterations:
+            # Out of tool budget: force a final answer from what has been gathered.
+            llm = self.llm.bind_tools(list(self.agent_tools.values()), tool_choice="none")
+            messages = messages + [HumanMessage("Tool budget reached. Answer now using the tool results above.")]
+        response = llm.invoke(messages)
+        if len(response.tool_calls) > 1:
+            response = AIMessage(content=response.content, tool_calls=response.tool_calls[:1])
+        state["messages"] = state["messages"] + [response]
+        state["iterations"] = state.get("iterations", 0) + 1
+        if not response.tool_calls:
+            state["final_answer"] = response.content if isinstance(response.content, str) else str(response.content)
+        return state
+
+    def tool_step(self, state: FinanceAgentState) -> FinanceAgentState:
+        last = state["messages"][-1]
+        results = dict(state.get("analysis_results", {}))
+        selected = list(state.get("selected_tools", []))
+        trace = list(state.get("tool_trace", []))
+        new_messages: list[ToolMessage] = []
+
+        for call in last.tool_calls:
+            name = call["name"]
+            args = dict(call.get("args") or {})
+            # Always scope tools to the signed-in user, whatever the model asked for.
+            args["user_id"] = state["user_id"]
+            tool = self.agent_tools.get(name)
+            if tool is None:
+                output = json.dumps({"error": f"Unknown tool: {name}"})
+            else:
+                try:
+                    output = tool.invoke(args)
+                except Exception as exc:
+                    output = json.dumps({"error": str(exc)})
+            try:
+                parsed = json.loads(output)
+            except Exception:
+                parsed = output
+            key = name if name not in results else f"{name}_{len(trace) + 1}"
+            results[key] = parsed
+            selected.append(name)
+            trace.append(f"{name}({', '.join(f'{k}={v}' for k, v in args.items() if k != 'user_id')})")
+            new_messages.append(ToolMessage(content=output[:6000], tool_call_id=call["id"], name=name))
+
+        state["messages"] = state["messages"] + new_messages
+        state["analysis_results"] = results
+        state["selected_tools"] = list(dict.fromkeys(selected))
+        state["tool_trace"] = trace
+        return state
+
+    def _run_agent(self, user_id: int, user_message: str) -> dict[str, Any]:
+        month = self._latest_user_month(user_id) or datetime.today().strftime("%Y-%m")
+        system = AGENT_SYSTEM_PROMPT.format(user_id=user_id, month=month, today=datetime.today().strftime("%Y-%m-%d"))
+        initial_state: FinanceAgentState = {
+            "user_id": user_id,
+            "user_message": user_message,
+            "month": month,
+            "messages": [SystemMessage(system), HumanMessage(user_message)],
+            "analysis_results": {},
+            "selected_tools": [],
+            "tool_trace": [],
+            "iterations": 0,
+        }
+        result = self.graph.invoke(initial_state, {"recursion_limit": 4 * config.agent_max_iterations + 4})
+        trace = result.get("tool_trace", [])
+        return {
+            "answer": result.get("final_answer") or "No response generated.",
+            "analysis": result.get("analysis_results", {}),
+            "reasoning": "Tools called by the agent:\n" + "\n".join(f"- {t}" for t in trace) if trace else "No tools were needed.",
+            "selected_tools": result.get("selected_tools", []),
+        }
+
+    def _run_fallback(self, user_id: int, user_message: str) -> dict[str, Any]:
+        # Rule-based path used only when the LLM is disabled or unreachable.
+        state: FinanceAgentState = {
+            "user_id": user_id,
+            "user_message": user_message,
+            "analysis_results": {},
+            "selected_tools": [],
+        }
+        state = self.understand_request(state)
+        parsed = _heuristic_tool_selection(user_message)
+        state["selected_tools"] = [t for t in parsed["tools"] if t in self.tools]
+        state = self.execute_analysis(state)
+        state = self.reasoning(state)
+        return {
+            "answer": self._fallback_advice(state),
+            "analysis": state.get("analysis_results", {}),
+            "reasoning": state.get("reasoning", ""),
+            "selected_tools": state.get("selected_tools", []),
+        }
 
     def understand_request(self, state: FinanceAgentState) -> FinanceAgentState:
         state["month"] = _extract_month(state["user_message"])
@@ -502,16 +603,12 @@ class FinanceWorkflow:
                 "selected_tools": [],
             }
 
-        initial_state: FinanceAgentState = {
-            "user_id": user_id,
-            "user_message": user_message,
-            "analysis_results": {},
-            "selected_tools": [],
-        }
-        result = self.graph.invoke(initial_state)
-        return {
-            "answer": result.get("final_answer", "No response generated."),
-            "analysis": result.get("analysis_results", {}),
-            "reasoning": result.get("reasoning", ""),
-            "selected_tools": result.get("selected_tools", []),
-        }
+        if not self.llm_enabled:
+            return self._run_fallback(user_id, user_message)
+        try:
+            return self._run_agent(user_id, user_message)
+        except Exception as exc:
+            logger.error("Agent run failed: %s", exc)
+            if self.llm_strict_mode:
+                raise LLMTimeoutError("The advisor agent failed. Please retry in a moment.") from exc
+            return self._run_fallback(user_id, user_message)

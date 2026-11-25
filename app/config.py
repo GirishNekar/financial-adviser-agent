@@ -21,6 +21,8 @@ class AppConfig(BaseModel):
     llm_token_type: str = os.getenv("SNOWFLAKE_TOKEN_TYPE", "OAUTH")
     llm_timeout_seconds: int = 45
     llm_max_retries: int = 2
+    # Maximum LLM -> tool round trips per question.
+    agent_max_iterations: int = 8
     llm_enabled: bool = True
     llm_strict_mode: bool = False
 

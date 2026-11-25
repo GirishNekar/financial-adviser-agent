@@ -36,6 +36,30 @@ class ReportInput(BaseModel):
     month: str = Field(..., description="Format: YYYY-MM")
 
 
+class WhatIfInput(BaseModel):
+    user_id: int = Field(..., gt=0)
+    month: str = Field(..., description="Baseline month, format: YYYY-MM")
+    income_change: float = Field(
+        default=0.0, description="Monthly change in income, e.g. +10000 for a 10k raise, -5000 for a pay cut"
+    )
+    expense_change: float = Field(
+        default=0.0, description="Monthly change in expenses, e.g. +8000 for new rent, -3000 for a cut"
+    )
+    one_time_cost: float = Field(
+        default=0.0, ge=0, description="One-off cost being evaluated (surgery, trip, purchase). 0 if none"
+    )
+    months_until_cost: int = Field(
+        default=0, ge=0, description="Months from now until the cost is due, e.g. 1 for 'next month'"
+    )
+
+
+class FundingPlanInput(BaseModel):
+    user_id: int = Field(..., gt=0)
+    month: str = Field(..., description="Baseline month, format: YYYY-MM")
+    cost: float = Field(..., gt=0, description="Total amount that needs to be funded")
+    months_until_cost: int = Field(default=0, ge=0, description="Months from now until payment is due")
+
+
 class CSVLoaderInput(BaseModel):
     table: str = Field(..., description="users|income|expenses|transactions|budgets|goals|investments|savings")
 
@@ -70,6 +94,28 @@ def build_finance_tools() -> dict[str, StructuredTool]:
 
     def affordability_checker(user_id: int, month: str, amount: float) -> str:
         return _to_json(finance.can_afford(user_id=user_id, month=month, amount=amount))
+
+    def what_if_scenario(
+        user_id: int,
+        month: str,
+        income_change: float = 0.0,
+        expense_change: float = 0.0,
+        one_time_cost: float = 0.0,
+        months_until_cost: int = 0,
+    ) -> str:
+        return _to_json(
+            finance.what_if_scenario(
+                user_id=user_id,
+                month=month,
+                income_change=income_change,
+                expense_change=expense_change,
+                one_time_cost=one_time_cost,
+                months_until_cost=months_until_cost,
+            )
+        )
+
+    def funding_plan(user_id: int, month: str, cost: float, months_until_cost: int = 0) -> str:
+        return _to_json(finance.funding_plan(user_id=user_id, month=month, cost=cost, months_until_cost=months_until_cost))
 
     def transaction_search(user_id: int, query: str, month: str | None = None) -> str:
         return _to_json(repo.get_transactions(user_id=user_id, query=query, month=month))
@@ -143,8 +189,32 @@ def build_finance_tools() -> dict[str, StructuredTool]:
         "affordability_checker": StructuredTool.from_function(
             func=affordability_checker,
             name="affordability_checker",
-            description="Check whether user can afford a requested amount in a given month.",
+            description=(
+                "Quick check whether the user can afford a one-off amount in a month with their CURRENT finances "
+                "(this month's savings + 20% of emergency fund). For hypothetical changes use what_if_scenario."
+            ),
             args_schema=AffordabilityInput,
+        ),
+        "what_if_scenario": StructuredTool.from_function(
+            func=what_if_scenario,
+            name="what_if_scenario",
+            description=(
+                "Simulate hypothetical changes: income change (raise / pay cut), expense change, and an optional "
+                "one-off cost due in N months. Returns new monthly surplus, cash available by then, shortfall and "
+                "months needed to save. Use for any 'if my salary / expenses changed...' question. "
+                "Keep income_change and one_time_cost as separate arguments."
+            ),
+            args_schema=WhatIfInput,
+        ),
+        "funding_plan": StructuredTool.from_function(
+            func=funding_plan,
+            name="funding_plan",
+            description=(
+                "Build a concrete plan for HOW to pay for a cost: mix of monthly surplus, temporary cuts to "
+                "discretionary categories, emergency fund, liquid investments, plus computed EMI / loan options. "
+                "Use whenever the user asks how to afford something or cannot fully afford it."
+            ),
+            args_schema=FundingPlanInput,
         ),
         "transaction_search": StructuredTool.from_function(
             func=transaction_search,
