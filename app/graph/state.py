@@ -8,6 +8,7 @@ class FinanceAgentState(TypedDict, total=False):
     month: str | None
     search_query: str | None
     requested_amount: float | None
+    purpose: str | None
     selected_tools: list[str]
     analysis_results: dict[str, Any]
     reasoning: str

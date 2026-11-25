@@ -34,14 +34,46 @@ def _normalize_month(raw_month: str | None, fallback: str) -> str:
     return fallback
 
 
+_AMOUNT_UNITS = {
+    "k": 1_000,
+    "thousand": 1_000,
+    "l": 100_000,
+    "lakh": 100_000,
+    "lakhs": 100_000,
+    "lac": 100_000,
+    "lacs": 100_000,
+    "cr": 10_000_000,
+    "crore": 10_000_000,
+    "crores": 10_000_000,
+}
+
+
 def _extract_amount(text: str) -> float | None:
-    match = re.search(r"(\d{4,7}(?:\.\d+)?)", text.replace(",", ""))
-    if not match:
+    cleaned = text.lower().replace(",", "")
+    # Amounts with units, e.g. "2 lakh", "1.5L", "80k", "Rs 3 crore".
+    unit_match = re.search(
+        r"(\d+(?:\.\d+)?)\s*(k|thousand|lakhs?|lacs?|l|crores?|cr)\b", cleaned
+    )
+    if unit_match:
+        return float(unit_match.group(1)) * _AMOUNT_UNITS[unit_match.group(2)]
+    # Plain amounts; skip YYYY-MM months and bare years like 2025 unless prefixed by a currency.
+    for match in re.finditer(r"(rs\.?|inr|₹|\$)?\s*(\d{3,9}(?:\.\d+)?)(-\d)?", cleaned):
+        currency, number, month_suffix = match.groups()
+        if month_suffix:
+            continue
+        value = float(number)
+        if not currency and 1900 <= value <= 2100:
+            continue
+        return value
+    return None
+
+
+def _to_amount(value: Any) -> float | None:
+    if value is None:
         return None
-    try:
-        return float(match.group(1))
-    except ValueError:
-        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    return _extract_amount(str(value))
 
 
 def _parse_json_from_llm_text(text: str) -> dict[str, Any] | None:
@@ -93,8 +125,10 @@ def _heuristic_tool_selection(user_message: str) -> dict[str, Any]:
         tools.append("financial_report_generator")
     if "income" in m:
         tools.append("income_analyzer")
-    if "afford" in m or "vacation" in m:
-        tools.append("affordability_checker")
+    if "afford" in m or "vacation" in m or "surgery" in m or "buy" in m:
+        if _extract_amount(user_message) is not None:
+            tools.append("affordability_checker")
+        tools.extend(["savings_calculator", "budget_checker", "goal_progress"])
 
     if not tools:
         tools = ["expense_analyzer", "savings_calculator", "budget_checker"]
@@ -200,7 +234,15 @@ class FinanceWorkflow:
         state["search_query"] = parsed.get("search_query")
         fallback_month = state.get("month") or datetime.today().strftime("%Y-%m")
         state["month"] = _normalize_month(parsed.get("month"), fallback_month)
-        state["requested_amount"] = parsed.get("requested_amount") or state.get("requested_amount")
+        # Trust the regex first (it only matches what the user typed), then the LLM.
+        state["requested_amount"] = state.get("requested_amount") or _to_amount(parsed.get("requested_amount"))
+        if state["requested_amount"] is None:
+            # Never run the affordability check against a made-up amount.
+            state["selected_tools"] = [t for t in state["selected_tools"] if t != "affordability_checker"]
+            for t in ("savings_calculator", "budget_checker", "goal_progress"):
+                if "afford" in state["user_message"].lower() and t not in state["selected_tools"]:
+                    state["selected_tools"].append(t)
+        state["purpose"] = parsed.get("purpose")
         return state
 
     def _latest_user_month(self, user_id: int) -> str | None:
@@ -242,7 +284,7 @@ class FinanceWorkflow:
             return {
                 "user_id": user_id,
                 "month": effective_month or datetime.today().strftime("%Y-%m"),
-                "amount": float(state.get("requested_amount") or 50000.0),
+                "amount": float(state["requested_amount"]),
             }
         if tool_name == "transaction_search":
             return {
@@ -308,9 +350,12 @@ class FinanceWorkflow:
     def generate_advice(self, state: FinanceAgentState) -> FinanceAgentState:
         analysis_compact = json.dumps(state.get("analysis_results", {}), default=str)
         analysis_compact = analysis_compact[:3500]
+        amount = state.get("requested_amount")
+        amount_note = f"Rs {float(amount):,.0f} (stated by the user)" if amount else "NOT PROVIDED by the user"
         prompt = FINAL_ANSWER_PROMPT.format(
             user_message=state["user_message"],
             analysis_json=analysis_compact,
+            amount_note=amount_note,
         )
         if not self.llm_enabled:
             state["final_answer"] = self._fallback_advice(state)
@@ -437,6 +482,11 @@ class FinanceWorkflow:
 
         if not key_points:
             key_points.append("Financial analysis is available, but no strong signal was detected from selected tools.")
+
+        if "afford" in state.get("user_message", "").lower() and not state.get("requested_amount"):
+            key_points.append(
+                "You did not mention the cost. Share the expected amount (e.g. the hospital quote) for an exact affordability check."
+            )
 
         next_action = (
             "Next action: target a 20%+ savings rate, cap your top expense category, and review weekly transactions."

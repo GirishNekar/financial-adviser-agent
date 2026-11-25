@@ -15,7 +15,7 @@ class AppConfig(BaseModel):
         "LLM_BASE_URL",
         "https://ww83019.ap-northeast-1.aws.snowflakecomputing.com/api/v2/cortex/v1",
     )
-    llm_model: str = os.getenv("LLM_MODEL", "llama3.1-8b")
+    llm_model: str = os.getenv("LLM_MODEL", "claude-sonnet-4-5")
     # Snowflake OAuth/PAT token; read from SNOWFLAKE_TOKEN or the token file on each LLM call.
     llm_token_file: Path = Path(os.getenv("SNOWFLAKE_TOKEN_FILE_PATH", "/snowflake/session/token"))
     llm_token_type: str = os.getenv("SNOWFLAKE_TOKEN_TYPE", "OAUTH")
